@@ -9,20 +9,20 @@ from pathlib import Path
 import streamlit as st
 import yt_dlp
 
-# --- Page Settings ---
+# --- Page Configuration ---
 st.set_page_config(page_title="ClipForge AI", page_icon="🎬", layout="wide")
 
 st.title("🎬 ClipForge AI")
 st.subheader("Turn long videos into short vertical clips")
 
-# --- Initialize Session State (Persists clips across button clicks) ---
+# --- Initialize Session State ---
 if "processed_clips" not in st.session_state:
     st.session_state.processed_clips = []
 if "zip_data" not in st.session_state:
     st.session_state.zip_data = None
 
 
-# --- Core Helper Functions ---
+# --- Helper Functions ---
 def run_command(command, timeout=300):
     return subprocess.run(
         command, capture_output=True, text=True, timeout=timeout
@@ -30,7 +30,7 @@ def run_command(command, timeout=300):
 
 
 def download_youtube_video(url, output_dir):
-    """Downloads video using format_sort to guarantee compatibility with all videos and live streams."""
+    """Downloads video using android/mweb clients and 10MB chunking to bypass CDN 403 blocks."""
     output_template = str(output_dir / "source.%(ext)s")
     cookie_file = None
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -44,6 +44,14 @@ def download_youtube_video(url, output_dir):
         "quiet": True,
         "no_warnings": True,
         "hls_prefer_native": True,
+        # 10MB chunking prevents googlevideo CDN connection drops on cloud servers
+        "http_chunk_size": 10485760,
+        # Use mobile clients that do not enforce strict desktop cookie IP-binding
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "mweb"],
+            }
+        },
     }
 
     if ffmpeg_bin:
@@ -57,11 +65,11 @@ def download_youtube_video(url, output_dir):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Check length first to protect the cloud container's memory/disk
+            # Check length first to protect cloud container RAM and disk
             info = ydl.extract_info(url, download=False)
             duration = info.get("duration", 0)
 
-            # If video is longer than 15 mins (e.g. multi-hour stream), only download the first 10 mins
+            # If video/stream is longer than 15 mins, download only first 10 mins
             if duration and duration > 900:
                 st.info(
                     f"⚠️ Long video/stream detected ({int(duration // 60)} minutes). "
@@ -73,14 +81,14 @@ def download_youtube_video(url, output_dir):
 
                 ydl_opts["download_ranges"] = download_slice
 
-        # Perform the actual download
+        # Download with finalized options
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
     except Exception as e:
         raise RuntimeError(
             f"YouTube download failed: {e}\n\n"
-            "If bot protection triggered, check your Secrets or use the '📁 Upload Video File' tab."
+            "If platform anti-bot blocks persist, please switch to the '📁 Upload Video File' tab."
         )
     finally:
         if cookie_file and cookie_file.exists():
@@ -110,7 +118,7 @@ def get_duration(video_path):
 
 
 def extract_audio_track(video_path, output_audio_path):
-    """Extracts a lightweight mono audio file once to scan volume rapidly."""
+    """Extracts a lightweight mono audio track for fast volume scanning."""
     run_command([
         "ffmpeg",
         "-y",
