@@ -1,0 +1,2 @@
+streamlit
+yt-dlp>=2025.01.0
