@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+from faster_whisper import WhisperModel
 import streamlit as st
 import yt_dlp
 
@@ -13,7 +14,7 @@ import yt_dlp
 st.set_page_config(page_title="ClipForge AI", page_icon="🎬", layout="wide")
 
 st.title("🎬 ClipForge AI")
-st.subheader("Turn long videos into short vertical clips")
+st.subheader("Turn long videos into short vertical clips with subtitles")
 
 # --- Initialize Session State ---
 if "processed_clips" not in st.session_state:
@@ -22,10 +23,17 @@ if "zip_data" not in st.session_state:
     st.session_state.zip_data = None
 
 
+# --- Cache Whisper Model in Memory ---
+@st.cache_resource
+def load_whisper_model():
+    """Loads the quantized tiny model (uses only ~150MB RAM and runs fast on CPU)."""
+    return WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
 # --- Helper Functions ---
-def run_command(command, timeout=300):
+def run_command(command, timeout=300, cwd=None):
     return subprocess.run(
-        command, capture_output=True, text=True, timeout=timeout
+        command, capture_output=True, text=True, timeout=timeout, cwd=cwd
     )
 
 
@@ -36,7 +44,6 @@ def download_youtube_video(url, output_dir):
     ffmpeg_bin = shutil.which("ffmpeg")
 
     ydl_opts = {
-        # Prioritize 720p/MP4 without strictly rejecting other formats
         "format_sort": ["res:720", "ext:mp4:m4a"],
         "outtmpl": output_template,
         "merge_output_format": "mp4",
@@ -44,9 +51,7 @@ def download_youtube_video(url, output_dir):
         "quiet": True,
         "no_warnings": True,
         "hls_prefer_native": True,
-        # 10MB chunking prevents googlevideo CDN connection drops on cloud servers
         "http_chunk_size": 10485760,
-        # Use mobile clients that do not enforce strict desktop cookie IP-binding
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "mweb"],
@@ -57,7 +62,6 @@ def download_youtube_video(url, output_dir):
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
 
-    # Load cookies from Streamlit Secrets if configured
     if "YOUTUBE_COOKIES" in st.secrets:
         cookie_file = output_dir / "cookies.txt"
         cookie_file.write_text(st.secrets["YOUTUBE_COOKIES"])
@@ -65,15 +69,13 @@ def download_youtube_video(url, output_dir):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Check length first to protect cloud container RAM and disk
             info = ydl.extract_info(url, download=False)
             duration = info.get("duration", 0)
 
-            # If video/stream is longer than 15 mins, download only first 10 mins
             if duration and duration > 900:
                 st.info(
                     f"⚠️ Long video/stream detected ({int(duration // 60)} minutes). "
-                    "Downloading the first 10 minutes to stay within cloud server memory limits."
+                    "Downloading the first 10 minutes to stay within server limits."
                 )
 
                 def download_slice(info_dict, ydl_instance):
@@ -81,14 +83,13 @@ def download_youtube_video(url, output_dir):
 
                 ydl_opts["download_ranges"] = download_slice
 
-        # Download with finalized options
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
     except Exception as e:
         raise RuntimeError(
             f"YouTube download failed: {e}\n\n"
-            "If platform anti-bot blocks persist, please switch to the '📁 Upload Video File' tab."
+            "If platform bot protection persists, switch to the '📁 Upload Video File' tab."
         )
     finally:
         if cookie_file and cookie_file.exists():
@@ -118,7 +119,7 @@ def get_duration(video_path):
 
 
 def extract_audio_track(video_path, output_audio_path):
-    """Extracts a lightweight mono audio track for fast volume scanning."""
+    """Extracts a lightweight mono audio track for volume scanning."""
     run_command([
         "ffmpeg",
         "-y",
@@ -193,8 +194,86 @@ def find_highlights(audio_path, duration, length, count):
     return selected
 
 
-def create_vertical_clip(video_path, output_path, start, length):
-    """Crops 16:9 into 9:16 vertical (720x1280) with ultrafast encoding."""
+def format_srt_time(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+
+def generate_subtitles(clip_audio_path, srt_output_path, whisper_model):
+    """Transcribes audio using faster-whisper and writes standard SRT."""
+    segments, _ = whisper_model.transcribe(
+        str(clip_audio_path), beam_size=1, word_timestamps=False
+    )
+
+    srt_content = []
+    for idx, segment in enumerate(segments, start=1):
+        start_time = format_srt_time(segment.start)
+        end_time = format_srt_time(segment.end)
+        text = segment.text.strip()
+        if text:
+            srt_content.append(f"{idx}\n{start_time} --> {end_time}\n{text}\n")
+
+    srt_output_path.write_text("\n".join(srt_content), encoding="utf-8")
+    return len(srt_content) > 0
+
+
+def create_vertical_clip(
+    video_path,
+    output_path,
+    start,
+    length,
+    work_dir,
+    whisper_model=None,
+    add_subs=True,
+):
+    """Crops to 9:16 vertical and burns in TikTok-style subtitles."""
+    srt_filename = f"{output_path.stem}.srt"
+    srt_path = work_dir / srt_filename
+    temp_clip_audio = work_dir / f"{output_path.stem}_audio.wav"
+
+    has_subtitles = False
+    if add_subs and whisper_model:
+        # Extract audio slice for transcription
+        run_command([
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start),
+            "-i",
+            str(video_path),
+            "-t",
+            str(length),
+            "-vn",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(temp_clip_audio),
+        ])
+
+        if temp_clip_audio.exists():
+            has_subtitles = generate_subtitles(
+                temp_clip_audio, srt_path, whisper_model
+            )
+
+    # Build video filter chain: 9:16 Crop + Optional Subtitle Burn
+    vf_chain = (
+        "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
+    )
+
+    if has_subtitles:
+        # Style: Yellow font, black outline, elevated 150px safe zone
+        sub_style = (
+            f"subtitles={srt_filename}:force_style="
+            "'FontName=Arial,FontSize=20,Bold=1,"
+            "PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,"
+            "Outline=2,Alignment=2,MarginV=150'"
+        )
+        vf_chain += f",{sub_style}"
+
     result = run_command(
         [
             "ffmpeg",
@@ -206,7 +285,7 @@ def create_vertical_clip(video_path, output_path, start, length):
             "-t",
             str(length),
             "-vf",
-            "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+            vf_chain,
             "-c:v",
             "libx264",
             "-preset",
@@ -222,6 +301,7 @@ def create_vertical_clip(video_path, output_path, start, length):
             str(output_path),
         ],
         timeout=300,
+        cwd=str(work_dir),  # Guarantees FFmpeg subtitle filter finds srt_filename cleanly
     )
 
     if result.returncode != 0:
@@ -230,28 +310,34 @@ def create_vertical_clip(video_path, output_path, start, length):
         )
 
 
-# --- User Interface Tabs ---
-tab_url, tab_upload = st.tabs(["🔗 Video URL", "📁 Upload Video File"])
-
-with tab_url:
-    video_url = st.text_input(
-        "Paste YouTube or video URL",
-        placeholder="https://www.youtube.com/watch?v=...",
-    )
+# --- User Interface ---
+tab_upload, tab_url = st.tabs(["📁 Upload Video File", "🔗 Video URL"])
 
 with tab_upload:
     uploaded_file = st.file_uploader(
-        "Upload a video directly (100% reliable fallback)",
+        "Upload a video file (MP4, MOV, MKV)",
         type=["mp4", "mov", "mkv"],
     )
 
-col1, col2 = st.columns(2)
+with tab_url:
+    video_url = st.text_input(
+        "Paste YouTube or video link",
+        placeholder="https://www.youtube.com/watch?v=...",
+    )
+
+col1, col2, col3 = st.columns(3)
 with col1:
     clip_length = st.selectbox(
         "Clip duration (seconds)", [15, 30, 45, 60], index=1
     )
 with col2:
-    number_of_clips = st.slider("Number of clips to generate", 1, 4, 2)
+    number_of_clips = st.slider("Number of clips", 1, 4, 2)
+with col3:
+    enable_subtitles = st.checkbox(
+        "✨ Auto-generate Subtitles",
+        value=True,
+        help="Transcribes speech and burns captions into the vertical clip.",
+    )
 
 process_btn = st.button(
     "🚀 Generate Clips", type="primary", use_container_width=True
@@ -266,12 +352,16 @@ if process_btn:
     if missing_tools:
         st.error(
             f"Missing system tools: {', '.join(missing_tools)}. "
-            "Please ensure you created a 'packages.txt' file with 'ffmpeg' in your repository."
+            "Please ensure you created a 'packages.txt' file with 'ffmpeg'."
         )
-    elif not video_url.strip() and uploaded_file is None:
-        st.warning("Please provide a video link or upload a file.")
+    elif uploaded_file is None and not video_url.strip():
+        st.warning("Please upload a file or paste a video link.")
     else:
         try:
+            whisper_model = (
+                load_whisper_model() if enable_subtitles else None
+            )
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 work_dir = Path(temp_dir)
                 source_video = None
@@ -302,20 +392,28 @@ if process_btn:
                 if not highlights:
                     raise RuntimeError("No highlights detected in this video.")
 
-                # 4. Generate vertical clips
+                # 4. Generate vertical clips + subtitles
                 generated_clips = []
-                clip_progress = st.progress(0, text="Rendering vertical clips...")
+                clip_progress = st.progress(
+                    0, text="Rendering vertical clips & captions..."
+                )
 
                 for idx, (score, start_sec) in enumerate(highlights, 1):
                     clip_progress.progress(
                         (idx - 1) / len(highlights),
-                        text=f"Rendering clip {idx}/{len(highlights)}...",
+                        text=f"Rendering clip {idx}/{len(highlights)} (with captions)...",
                     )
                     filename = f"clip_{idx}.mp4"
                     output_file = work_dir / filename
 
                     create_vertical_clip(
-                        source_video, output_file, start_sec, clip_length
+                        source_video,
+                        output_file,
+                        start_sec,
+                        clip_length,
+                        work_dir,
+                        whisper_model=whisper_model,
+                        add_subs=enable_subtitles,
                     )
 
                     with open(output_file, "rb") as f:
@@ -335,7 +433,6 @@ if process_btn:
                     for clip in generated_clips:
                         archive.writestr(clip["name"], clip["bytes"])
 
-                # Save to session_state so interaction doesn't wipe results
                 st.session_state.processed_clips = generated_clips
                 st.session_state.zip_data = zip_path.read_bytes()
 
@@ -344,11 +441,11 @@ if process_btn:
         except Exception as err:
             st.error(f"Error: {err}")
 
-# --- Render Results (Persisted Across Button Clicks) ---
+# --- Render Results ---
 if st.session_state.processed_clips:
     st.divider()
     st.success(
-        f"Generated {len(st.session_state.processed_clips)} vertical clips!"
+        f"Generated {len(st.session_state.processed_clips)} vertical clips with subtitles!"
     )
 
     if st.session_state.zip_data:
