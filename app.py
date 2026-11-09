@@ -38,43 +38,45 @@ def run_command(command, timeout=300, cwd=None):
 
 
 def download_youtube_video(url, output_dir):
-    """Downloads video using android/mweb clients and 10MB chunking to bypass CDN 403 blocks."""
+    """Downloads video anonymously via the Android client without IP-pinned cookies."""
     output_template = str(output_dir / "source.%(ext)s")
-    cookie_file = None
     ffmpeg_bin = shutil.which("ffmpeg")
 
     ydl_opts = {
-        "format_sort": ["res:720", "ext:mp4:m4a"],
+        # Select best 720p or fallback
+        "format": "best[height<=720]/bestvideo[height<=720]+bestaudio/best",
         "outtmpl": output_template,
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "hls_prefer_native": True,
-        "http_chunk_size": 10485760,
+        # Force Android client which does NOT require cookies or IP matching
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "mweb"],
+                "player_client": ["android"],
             }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "com.google.android.youtube/19.29.37 (Linux; U; Android 14; US)"
+                " gzip"
+            ),
         },
     }
 
     if ffmpeg_bin:
         ydl_opts["ffmpeg_location"] = ffmpeg_bin
 
-    if "YOUTUBE_COOKIES" in st.secrets:
-        cookie_file = output_dir / "cookies.txt"
-        cookie_file.write_text(st.secrets["YOUTUBE_COOKIES"])
-        ydl_opts["cookiefile"] = str(cookie_file)
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Check length first to protect cloud RAM
             info = ydl.extract_info(url, download=False)
             duration = info.get("duration", 0)
 
+            # Limit long streams (> 15 mins) to first 10 mins
             if duration and duration > 900:
                 st.info(
-                    f"⚠️ Long video/stream detected ({int(duration // 60)} minutes). "
+                    f"⚠️ Long video/stream detected ({int(duration // 60)} mins). "
                     "Downloading the first 10 minutes to stay within server limits."
                 )
 
@@ -83,17 +85,16 @@ def download_youtube_video(url, output_dir):
 
                 ydl_opts["download_ranges"] = download_slice
 
+        # Execute download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
     except Exception as e:
         raise RuntimeError(
             f"YouTube download failed: {e}\n\n"
-            "If platform bot protection persists, switch to the '📁 Upload Video File' tab."
+            "Because YouTube frequently blocks cloud hosting providers (AWS), "
+            "please use the '📁 Upload Video File' tab to process your video."
         )
-    finally:
-        if cookie_file and cookie_file.exists():
-            cookie_file.unlink()
 
     files = list(output_dir.glob("source.*"))
     if not files:
